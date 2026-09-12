@@ -1,0 +1,9 @@
+bin/
+.embedded-postgres-go/
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+local.*

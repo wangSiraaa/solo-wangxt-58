@@ -1,0 +1,448 @@
+openapi: 3.0.3
+info:
+  title: 格位合同服务（寄存机构 · 仅 API）
+  version: 1.0.0
+  description: |
+    面向办理窗口的格位（寄存位）合同服务，仅提供 HTTP API，不含前端。
+
+    **核心规则**
+    1. 合同登记后为 `pending_review`，复核（review）通过才生效并建立占位区间；
+    2. 同一格位的有效占位区间互不重叠（数据库排他约束兜底，并发安全）；
+    3. 缴费只能由本地模拟回执（mock-receipt）驱动，请求体中的 `paid`/`status` 等字段一律被拒绝；
+    4. 迁出 / 迁位前须清偿全部未付费用，经办联系人须已核实且授权级别为 `handle`/`full`；
+    5. 迁位在单事务内结束原占位并建立新占位：欠费时保留草案（`draft`），
+       目标格位冲突时草案置 `failed`，原合同与原占位不受影响；
+    6. 证件号等敏感信息按角色脱敏（复核岗/管理员可见完整号码），访问日志不落完整证件号。
+
+    **角色**：`clerk`（窗口）、`reviewer`（复核）、`finance`（财务）、`admin`（管理员）。
+    认证方式为 Bearer token，token 与工号/角色的映射由服务端配置（环境变量 `STAFF_TOKENS`）。
+
+servers:
+  - url: http://localhost:8080
+
+tags:
+  - {name: niches, description: 空位查询}
+  - {name: contacts, description: 联系人（敏感，按角色脱敏）}
+  - {name: contracts, description: 合同登记 / 复核 / 迁出}
+  - {name: payments, description: 缴费（本地模拟回执）}
+  - {name: relocations, description: 内部迁位}
+
+paths:
+  /healthz:
+    get:
+      summary: 健康检查
+      security: []
+      responses:
+        '200': {description: OK}
+
+  /api/v1/niches/available:
+    get:
+      tags: [niches]
+      summary: 查询指定期间内的空格位
+      parameters:
+        - {name: zone, in: query, schema: {type: string}, description: 分区，如 A/B/C}
+        - {name: start_at, in: query, schema: {type: string, format: date-time}, description: 缺省为当前时间}
+        - {name: end_at, in: query, schema: {type: string, format: date-time}, description: 缺省为 start_at + 1 年}
+      responses:
+        '200':
+          description: 空格位列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  niches: {type: array, items: {$ref: '#/components/schemas/Niche'}}
+                  start_at: {type: string, format: date-time}
+                  end_at: {type: string, format: date-time}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+
+  /api/v1/niches/{id}:
+    get:
+      tags: [niches]
+      summary: 格位详情（含当前有效占位）
+      parameters: [{$ref: '#/components/parameters/id'}]
+      responses:
+        '200':
+          description: 格位与当前占位
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  niche: {$ref: '#/components/schemas/Niche'}
+                  current_occupancy: {nullable: true, allOf: [{$ref: '#/components/schemas/Occupancy'}]}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /api/v1/contacts:
+    post:
+      tags: [contacts]
+      summary: 登记联系人（窗口）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ContactInput'}
+      responses:
+        '201': {description: 已创建, content: {application/json: {schema: {$ref: '#/components/schemas/Contact'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+
+  /api/v1/contacts/{id}:
+    get:
+      tags: [contacts]
+      summary: 联系人详情（按角色脱敏）
+      parameters: [{$ref: '#/components/parameters/id'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/Contact'}}}}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /api/v1/contracts:
+    post:
+      tags: [contracts]
+      summary: 登记合同（待复核，不产生占位）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateContractInput'}
+      responses:
+        '201': {description: 已登记, content: {application/json: {schema: {$ref: '#/components/schemas/ContractDetail'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409':
+          description: 格位在所选期间已被占用（预检）
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+  /api/v1/contracts/{id}:
+    get:
+      tags: [contracts]
+      summary: 合同详情（含联系人、占位区间；证件号按角色脱敏）
+      parameters: [{$ref: '#/components/parameters/id'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/ContractDetail'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /api/v1/contracts/{id}/contacts:
+    post:
+      tags: [contracts]
+      summary: 为合同追加联系人关联（未核实）
+      parameters: [{$ref: '#/components/parameters/id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ContactLinkInput'}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/ContractDetail'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /api/v1/contract-contacts/{id}/verify:
+    post:
+      tags: [contracts]
+      summary: 核实联系人关系（复核岗）
+      parameters: [{$ref: '#/components/parameters/id'}]
+      responses:
+        '200': {description: 已核实}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /api/v1/contracts/{id}/review:
+    post:
+      tags: [contracts]
+      summary: 信息复核（复核岗）。通过 = 生效 + 建立占位 + 生成首年账单
+      description: |
+        通过的前置条件：至少一名已核实且授权为 `handle`/`full` 的联系人。
+        两个窗口同时复核通过同一格位的重叠合同，只有一个成功（排他约束），另一个得到 409。
+      parameters: [{$ref: '#/components/parameters/id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                approve: {type: boolean}
+                note: {type: string}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/ContractDetail'}}}}
+        '409':
+          description: 占位冲突 / 无已核实联系人 / 状态不允许
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+  /api/v1/contracts/{id}/checkout:
+    post:
+      tags: [contracts]
+      summary: 迁出（结束占位并终止合同）
+      description: 前置条件：合同 active、全部费用已清偿、经办联系人已核实且具办理权限。任一不满足则整体不变。
+      parameters: [{$ref: '#/components/parameters/id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contact_id]
+              properties:
+                contact_id: {type: integer, format: int64}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/ContractDetail'}}}}
+        '409':
+          description: 欠费（outstanding_fees）/ 联系人未核实（contact_not_verified）/ 状态不允许
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+  /api/v1/contracts/{id}/payments:
+    post:
+      tags: [payments]
+      summary: 开立账单（窗口）
+      description: |
+        请求体**只允许** `kind` 与 `amount_cents`；携带 `paid`、`status`、`receipt_no`、`paid_at`
+        中任意字段一律返回 400 —— 缴费状态只能由本地模拟回执推进。
+      parameters: [{$ref: '#/components/parameters/id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, amount_cents]
+              properties:
+                kind: {type: string, enum: [annual_fee, other]}
+                amount_cents: {type: integer, format: int64, minimum: 1}
+      responses:
+        '201': {description: 已开立, content: {application/json: {schema: {$ref: '#/components/schemas/Payment'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+    get:
+      tags: [payments]
+      summary: 合同账单列表
+      parameters: [{$ref: '#/components/parameters/id'}]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payments: {type: array, items: {$ref: '#/components/schemas/Payment'}}
+
+  /api/v1/payments/{id}/mock-receipt:
+    post:
+      tags: [payments]
+      summary: 本地模拟回执（财务）——服务端生成回执号并置为已付
+      description: 幂等：并发或重复调用返回同一张回执，账单只被支付一次。
+      parameters: [{$ref: '#/components/parameters/id'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/Payment'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /api/v1/contracts/{id}/relocations:
+    post:
+      tags: [relocations]
+      summary: 建立迁位草案（欠费也可建草案，提交时才核对清偿）
+      parameters: [{$ref: '#/components/parameters/id'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_niche_id, contact_id]
+              properties:
+                to_niche_id: {type: integer, format: int64}
+                contact_id: {type: integer, format: int64}
+      responses:
+        '201': {description: 草案已建立（含迁位手续费账单）, content: {application/json: {schema: {$ref: '#/components/schemas/Relocation'}}}}
+        '409': {description: 状态不允许 / 联系人未核实, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+
+  /api/v1/relocations/{id}/commit:
+    post:
+      tags: [relocations]
+      summary: 提交迁位（单事务：结束原占位 + 建立新占位）
+      description: |
+        - 欠费：返回 409 `outstanding_fees`，草案保持 `draft`，无任何写操作；
+        - 目标格位被占用：事务回滚，草案置 `failed`，原合同与原占位保持有效；
+        - 成功：原占位结束、新占位建立、合同格位更新，草案置 `committed`。
+      parameters: [{$ref: '#/components/parameters/id'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/Relocation'}}}}
+        '409': {description: 欠费 / 格位冲突 / 状态不允许, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+
+  /api/v1/relocations/{id}:
+    get:
+      tags: [relocations]
+      summary: 迁位单详情
+      parameters: [{$ref: '#/components/parameters/id'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/Relocation'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: token 与工号/角色的映射由服务端配置
+
+  parameters:
+    id:
+      name: id
+      in: path
+      required: true
+      schema: {type: integer, format: int64}
+
+  responses:
+    BadRequest:
+      description: 请求不合法
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    Unauthorized:
+      description: 未认证
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    Forbidden:
+      description: 角色无权访问
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+    NotFound:
+      description: 不存在
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: {type: string}
+        code:
+          type: string
+          enum: [bad_request, unauthorized, forbidden, not_found, invalid_state,
+                 niche_unavailable, outstanding_fees, contact_not_verified, internal]
+
+    Niche:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        code: {type: string, example: A-01-001}
+        zone: {type: string}
+        level: {type: integer}
+        price_per_year_cents: {type: integer, format: int64}
+        status: {type: string, enum: [available, maintenance]}
+
+    Contact:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string}
+        id_number: {type: string, description: 按角色脱敏，如 1101************34}
+        phone: {type: string, description: 按角色脱敏，如 138****1234}
+        relation: {type: string}
+        created_at: {type: string, format: date-time}
+
+    ContactInput:
+      type: object
+      required: [name, id_number, phone]
+      properties:
+        name: {type: string}
+        id_number: {type: string}
+        phone: {type: string}
+        relation: {type: string}
+
+    ContactLinkInput:
+      type: object
+      required: [auth_level]
+      properties:
+        contact_id: {type: integer, format: int64, description: 关联已有联系人；缺省则按下列字段新建/复用}
+        name: {type: string}
+        id_number: {type: string}
+        phone: {type: string}
+        relation: {type: string}
+        auth_level: {type: string, enum: [view, handle, full]}
+
+    CreateContractInput:
+      type: object
+      required: [niche_id, deceased_name, deceased_id_number, start_at, end_at]
+      properties:
+        niche_id: {type: integer, format: int64}
+        deceased_name: {type: string}
+        deceased_id_number: {type: string}
+        start_at: {type: string, format: date-time}
+        end_at: {type: string, format: date-time}
+        contacts:
+          type: array
+          items: {$ref: '#/components/schemas/ContactLinkInput'}
+
+    ContractContact:
+      type: object
+      properties:
+        link_id: {type: integer, format: int64}
+        contact_id: {type: integer, format: int64}
+        name: {type: string}
+        id_number: {type: string}
+        phone: {type: string}
+        relation: {type: string}
+        auth_level: {type: string, enum: [view, handle, full]}
+        verified: {type: boolean}
+        verified_by: {type: string, nullable: true}
+        verified_at: {type: string, format: date-time, nullable: true}
+
+    Occupancy:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        contract_id: {type: integer, format: int64}
+        niche_id: {type: integer, format: int64}
+        niche_code: {type: string}
+        kind: {type: string, enum: [initial, relocation]}
+        status: {type: string, enum: [active, ended]}
+        start_at: {type: string, format: date-time}
+        end_at: {type: string, format: date-time}
+
+    ContractDetail:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        contract_no: {type: string}
+        niche_id: {type: integer, format: int64}
+        niche_code: {type: string}
+        deceased_name: {type: string}
+        deceased_id_number: {type: string, description: 按角色脱敏}
+        status: {type: string, enum: [pending_review, active, ended, cancelled]}
+        start_at: {type: string, format: date-time}
+        end_at: {type: string, format: date-time}
+        annual_fee_cents: {type: integer, format: int64}
+        review_note: {type: string, nullable: true}
+        reviewed_by: {type: string, nullable: true}
+        reviewed_at: {type: string, format: date-time, nullable: true}
+        created_by: {type: string}
+        created_at: {type: string, format: date-time}
+        contacts: {type: array, items: {$ref: '#/components/schemas/ContractContact'}}
+        occupancies: {type: array, items: {$ref: '#/components/schemas/Occupancy'}}
+
+    Payment:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        contract_id: {type: integer, format: int64}
+        relocation_id: {type: integer, format: int64, nullable: true}
+        kind: {type: string, enum: [annual_fee, relocation_fee, other]}
+        amount_cents: {type: integer, format: int64}
+        status: {type: string, enum: [unpaid, paid, void]}
+        receipt_no: {type: string, nullable: true}
+        paid_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+
+    Relocation:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        contract_id: {type: integer, format: int64}
+        from_niche_id: {type: integer, format: int64}
+        to_niche_id: {type: integer, format: int64}
+        from_niche_code: {type: string}
+        to_niche_code: {type: string}
+        contact_id: {type: integer, format: int64}
+        status: {type: string, enum: [draft, committed, failed, cancelled]}
+        fail_reason: {type: string, nullable: true}
+        requested_by: {type: string}
+        created_at: {type: string, format: date-time}
+        committed_at: {type: string, format: date-time, nullable: true}
+        fee_payment_id: {type: integer, format: int64, nullable: true}
+
+security:
+  - bearerAuth: []
